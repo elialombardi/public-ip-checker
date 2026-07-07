@@ -6,7 +6,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cloudflare/cloudflare-go"
@@ -38,16 +41,11 @@ func getPublicIP() (string, error) {
 }
 
 func main() {
-	ctx := context.Background()
+	// Use a context that cancels on SIGINT/SIGTERM so we can exit cleanly
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// 1. Get the current public IP
-	currentIP, err := getPublicIP()
-	if err != nil {
-		log.Fatalf("Error fetching public IP: %v", err)
-	}
-	log.Printf("Current Public IP: %s", currentIP)
-
-	// 2. Read Cloudflare API token from environment and initialize client
+	// 1. Read Cloudflare API token from environment and initialize client
 	apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
 	if strings.TrimSpace(apiToken) == "" {
 		log.Fatalf("Environment variable CLOUDFLARE_API_TOKEN is not set or empty")
@@ -58,7 +56,7 @@ func main() {
 		log.Fatalf("Error initializing Cloudflare client: %v", err)
 	}
 
-	// 3. Read zone name from environment and fetch the Zone ID
+	// 2. Read zone name from environment and fetch the Zone ID
 	zoneName := os.Getenv("CLOUDFLARE_ZONE")
 	if strings.TrimSpace(zoneName) == "" {
 		log.Fatalf("Environment variable CLOUDFLARE_ZONE is not set or empty")
@@ -67,15 +65,6 @@ func main() {
 	zoneID, err := api.ZoneIDByName(zoneName)
 	if err != nil {
 		log.Fatalf("Error fetching Zone ID: %v", err)
-	}
-
-	// 4. Fetch existing DNS records for the zone
-	// We look for 'A' records, change Type to 'CNAME' if you are mapping to a domain string instead
-	records, _, err := api.ListDNSRecords(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.ListDNSRecordsParams{
-		Type: "A", 
-	})
-	if err != nil {
-		log.Fatalf("Error fetching DNS records: %v", err)
 	}
 
 	// If CLOUDFLARE_DOMAINS is set, use it (comma-separated list). Otherwise use the hardcoded list.
@@ -103,22 +92,77 @@ func main() {
 		targets[d] = true
 	}
 
-	// 5. Compare and update records
+	// Determine run interval from environment. Prefer RUN_INTERVAL (Go duration string),
+	// fall back to RUN_INTERVAL_SECONDS (integer seconds). Default to 5m.
+	var interval time.Duration
+	if s := strings.TrimSpace(os.Getenv("RUN_INTERVAL")); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			log.Fatalf("Invalid RUN_INTERVAL value: %v", err)
+		}
+		interval = d
+	} else if s := strings.TrimSpace(os.Getenv("RUN_INTERVAL_SECONDS")); s != "" {
+		secs, err := strconv.Atoi(s)
+		if err != nil || secs <= 0 {
+			log.Fatalf("Invalid RUN_INTERVAL_SECONDS value: %v", err)
+		}
+		interval = time.Duration(secs) * time.Second
+	} else {
+		interval = 5 * time.Minute
+	}
+
+	log.Printf("Running update job every %s", interval)
+
+	// Run once immediately, then on interval until cancelled
+	if err := doUpdate(ctx, api, zoneID, targets); err != nil {
+		log.Printf("Initial update failed: %v", err)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Shutdown signal received, exiting")
+			return
+		case <-ticker.C:
+			if err := doUpdate(ctx, api, zoneID, targets); err != nil {
+				log.Printf("Update failed: %v", err)
+			}
+		}
+	}
+}
+
+// doUpdate performs a single fetch-and-update cycle.
+func doUpdate(ctx context.Context, api *cloudflare.API, zoneID string, targets map[string]bool) error {
+	// Get the current public IP
+	currentIP, err := getPublicIP()
+	if err != nil {
+		return err
+	}
+	log.Printf("Current Public IP: %s", currentIP)
+
+	// Fetch existing DNS A records for the zone
+	records, _, err := api.ListDNSRecords(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.ListDNSRecordsParams{Type: "A"})
+	if err != nil {
+		return err
+	}
+
+	// Compare and update records as needed
 	for _, record := range records {
 		if targets[record.Name] {
 			if record.Content == currentIP {
 				log.Printf("[%s] IP matches (%s). No update needed.", record.Name, record.Content)
 			} else {
 				log.Printf("[%s] IP mismatch! DNS has %s, current is %s. Updating...", record.Name, record.Content, currentIP)
-				
-				// Update the record with the new IP
 				_, err := api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.UpdateDNSRecordParams{
 					ID:      record.ID,
-					Type:    "A", // Change to "CNAME" if using canonical names
+					Type:    "A",
 					Name:    record.Name,
 					Content: currentIP,
-					TTL:     1, // 1 = Automatic TTL
-					Proxied: record.Proxied, // Preserve existing proxy status (orange/grey cloud)
+					TTL:     1,
+					Proxied: record.Proxied,
 				})
 
 				if err != nil {
@@ -129,4 +173,6 @@ func main() {
 			}
 		}
 	}
+
+	return nil
 }
